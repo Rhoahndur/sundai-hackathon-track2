@@ -3,9 +3,9 @@
 #include <torch/extension.h>
 #include <c10/cuda/CUDAStream.h>
 
-// CUTLASS: only used for its RowMajorTensorOpMultiplicandCrosswise SMEM layout
-// (gives us the canonical ldmatrix-friendly swizzle for INT4) and as a typed
-// wrapper around the sm_80 INT4 MMA PTX. Build requires v4.4.2+ headers on
+// CUTLASS: used for the RowMajorTensorOpMultiplicandCrosswise SMEM layout
+// (canonical ldmatrix-friendly INT4 swizzle) and a typed wrapper around the
+// sm_80 INT4 MMA PTX. Build requires v4.4.2+ headers on
 // NVCC_APPEND_FLAGS="-I/path/to/cutlass/include".
 #include <cutlass/cutlass.h>
 #include <cutlass/numeric_types.h>
@@ -16,9 +16,6 @@
 #include <cutlass/arch/mma_sm80.h>
 #include <cutlass/layout/tensor_op_multiplicand_sm80.h>
 
-// ---- MMA wrapper: m16n8k64 INT4xINT4 -> INT32 ----
-// CUTLASS's Mma specialization pins to OpMultiplyAddSaturate; identical to
-// OpMultiplyAdd for our data (max |acc| = 64*7*8 = 3584, well inside int32).
 using CutlassMmaOp = cutlass::arch::Mma<
     cutlass::gemm::GemmShape<16, 8, 64>,
     32,
@@ -29,7 +26,8 @@ using CutlassMmaOp = cutlass::arch::Mma<
 >;
 
 // ============================================================================
-// Offline-quant kernel: writes block-major A / scales_A for this GEMM.
+// Offline-quant kernel: writes block-major A / scales_A for the GEMM consumer.
+// QUANT_BLOCK_M MUST match the GEMM's BLOCK_M. v3 drops it from 128 -> 64.
 // ============================================================================
 __global__ void quantize_int4_kernel(
     const half* __restrict__ input,
@@ -39,7 +37,7 @@ __global__ void quantize_int4_kernel(
     int K,
     int group_size)
 {
-    constexpr int QUANT_BLOCK_M = 128;
+    constexpr int QUANT_BLOCK_M = 64;   // MUST match GEMM's BLOCK_M (v3)
 
     int row = blockIdx.x * blockDim.x + threadIdx.x;
     int group = blockIdx.y;
@@ -109,60 +107,62 @@ std::vector<torch::Tensor> quantize_int4_custom(torch::Tensor input, int group_s
 }
 
 // ============================================================================
-// GEMM kernel -- COMET-style W4A4 pipeline (v2: live-state trimmed)
+// GEMM kernel -- COMET-style W4A4, v3: tile-shape restructure for occupancy
 //
-// The architecture attacks the structural ceiling the old 200-TOPs kernel hit:
-// three __syncthreads per K-iter, driven by a smem_sb staging step that was
-// separate from the weights cp.async group.
+// v2 (199.5 baseline) was pinned at 2 blocks/SM with 8 warps/block = 16 active
+// warps/SM. The MMA pipe was 65% utilized but we could not break past it
+// because there were simply not enough live warps to hide dependency/issue
+// latency in the mainloop. The scale-FMA work inside the K loop cost too much
+// when only 16 warps competed for issue slots.
 //
-// Key changes vs the old kernel:
-//   - scales_A and scales_B live in the SAME cp.async group as the weight
-//     tiles. A single committed group drains A + B + scales_A + scales_B
-//     together, so the "gmem -> fp32 smem_sb + extra sync" stage is gone.
-//   - Down to 2 __syncthreads per K-iter (top-of-iter after cp_wait +
-//     end-of-iter to guard the prefetch stage-reuse race).
-//   - Single ldmatrix.x2 B-frag load. The paired x4 variant regressed on
-//     Ampere due to the extra register live range, and the v1 sb_pair
-//     register cache regressed 30% because it pushed the kernel out of the
-//     2-block/SM tier. v2 deliberately reads scales_B per-tn from SMEM and
-//     shfl-broadcasts inside the tile loop -- keeps the live-state flat.
-//   - __launch_bounds__(256, 2) pins the register budget to 128 regs/thread
-//     so the compiler can't silently drop occupancy.
+// v3 attacks that wall by shrinking every live-state dimension:
+//   BLOCK_M=BLOCK_N=64 (was 128 each)   -> 1/4 the output area per CTA
+//   NUM_WARPS=4 in a 2x2 grid           -> 1/2 the warps per CTA
+//   TILES_M=TILES_N=2 (was 2 x 8)       -> 1/4 the MMA count per K-iter
+//   acc[2][2][4] = 16 fp32/thread       -> 1/4 the accumulator registers
 //
-// Fixed layout:
-//   BLOCK_M=BLOCK_N=128, BLOCK_K=group_size=64, 8 warps in a 4x2 grid.
-//   Per stage SMEM:
-//     A  : 128 rows x 32 bytes = 4096 B (CUTLASS crosswise swizzle)
-//     B  : 128 rows x 32 bytes = 4096 B (CUTLASS crosswise swizzle)
-//     sA : 128 halves           =  256 B (linear, no swizzle)
-//     sB : 128 halves           =  256 B (linear, no swizzle)
-//   2 stages -> 17.4 KB / block, still comfortably inside the 5-block/SM tier
-//   on sm_86 (96 KB usable L1/SMEM per SM).
+// Expected register envelope: ~55-65 regs/thread (was ~100). That puts us at
+// 8 blocks/SM from the register limit, 32 active warps/SM -- 2x the old
+// latency-hiding budget. Per-SM MMA work rate is unchanged (more CTAs, each
+// doing less), so the win is purely in pipeline/issue saturation.
+//
+// CTA count grows 4x (stronger parallelism on 84 SMs), but per-CTA epilogue
+// work shrinks 4x, so launch/tail overhead stays bounded.
+//
+// SMEM per stage  : 64*32 + 64*32 + 64*2 + 64*2 = 4352 B
+// SMEM per block  : 2 stages -> 8704 B   (prev. 17408)
+// SMEM occupancy  : 96000 / 8704 = 11 blocks/SM -- not the limit
+// Register limit  : 65536 / (128 * 64 regs) ~= 8 blocks/SM -- the limit
+//
+// COMET-direction invariants preserved:
+//   - Block-major A/B/scales layouts (unchanged)
+//   - scales_A / scales_B in the same cp.async group as the weight tiles
+//   - 2 __syncthreads / K-iter (top + end); no smem_sb staging
+//   - CUTLASS crosswise SMEM swizzle for ldmatrix-friendly weights
 // ============================================================================
 
-static constexpr int BLOCK_M    = 128;
-static constexpr int BLOCK_N    = 128;
-static constexpr int BLOCK_K    = 64;      // must equal quant group_size
+static constexpr int BLOCK_M    = 64;
+static constexpr int BLOCK_N    = 64;
+static constexpr int BLOCK_K    = 64;     // must equal quant group_size
 static constexpr int WARP_SZ    = 32;
-static constexpr int NUM_WARPS  = 8;
-static constexpr int WARPS_M    = 4;
+static constexpr int NUM_WARPS  = 4;
+static constexpr int WARPS_M    = 2;
 static constexpr int WARPS_N    = 2;
 static constexpr int WARP_M     = BLOCK_M / WARPS_M;   // 32
-static constexpr int WARP_N     = BLOCK_N / WARPS_N;   // 64
+static constexpr int WARP_N     = BLOCK_N / WARPS_N;   // 32
 static constexpr int TILES_M    = WARP_M / 16;         // 2
-static constexpr int TILES_N    = WARP_N / 8;          // 8
+static constexpr int TILES_N    = WARP_N / 8;          // 4
 static constexpr int NUM_STAGES = 2;
 static constexpr int SMEM_STRIDE = BLOCK_K / 2;        // 32 bytes / row
 
-// Per-stage SMEM byte layout.
-static constexpr int TILE_A_BYTES  = BLOCK_M * SMEM_STRIDE;   // 4096
-static constexpr int TILE_B_BYTES  = BLOCK_N * SMEM_STRIDE;   // 4096
-static constexpr int TILE_SA_BYTES = BLOCK_M * 2;             // 256 (fp16)
-static constexpr int TILE_SB_BYTES = BLOCK_N * 2;             // 256 (fp16)
+static constexpr int TILE_A_BYTES  = BLOCK_M * SMEM_STRIDE;   // 2048
+static constexpr int TILE_B_BYTES  = BLOCK_N * SMEM_STRIDE;   // 2048
+static constexpr int TILE_SA_BYTES = BLOCK_M * 2;             // 128 (fp16)
+static constexpr int TILE_SB_BYTES = BLOCK_N * 2;             // 128 (fp16)
 static constexpr int STAGE_BYTES   = TILE_A_BYTES + TILE_B_BYTES
-                                   + TILE_SA_BYTES + TILE_SB_BYTES;
+                                   + TILE_SA_BYTES + TILE_SB_BYTES;  // 4352
+static constexpr int NUM_THREADS   = WARP_SZ * NUM_WARPS;     // 128
 
-// ---- MMA wrapper routed through CUTLASS's typed Mma ----
 __device__ __forceinline__ void mma_s4(uint4 a, uint2 b, int (&c)[4]) {
     using FragA = typename CutlassMmaOp::FragmentA;
     using FragB = typename CutlassMmaOp::FragmentB;
@@ -177,19 +177,16 @@ __device__ __forceinline__ void mma_s4(uint4 a, uint2 b, int (&c)[4]) {
     mma(fc, fa, fb, fc);
 }
 
-// ---- CUTLASS-layout-driven SMEM offset ----
-// Swizzle shared by A and B (same int4 crosswise pattern).
 using SmemLayoutAB = cutlass::layout::RowMajorTensorOpMultiplicandCrosswise<
     cutlass::sizeof_bits<cutlass::int4b_t>::value, BLOCK_K>;
 
 __device__ __forceinline__ int cutlass_smem_byte_off(int row, int col_byte) {
     SmemLayoutAB layout = SmemLayoutAB::packed({BLOCK_M, BLOCK_K});
-    int col_int4 = col_byte * 2;   // 2 int4 per byte
+    int col_int4 = col_byte * 2;
     int off_int4 = layout({row, col_int4});
     return off_int4 / 2;
 }
 
-// ---- cp.async helpers ----
 __device__ __forceinline__ void cp_async_16(void *dst, const void *src, bool pred) {
     unsigned s = __cvta_generic_to_shared(dst);
     asm volatile(
@@ -205,7 +202,6 @@ __device__ __forceinline__ void cp_wait(int n) {
     else             asm volatile("cp.async.wait_group 2;\n");
 }
 
-// ---- Frag loads ----
 __device__ __forceinline__ uint4 load_a_frag(const uint8_t *smem_base, int abs_row_start) {
     int lane      = threadIdx.x & (WARP_SZ - 1);
     int local_row = lane & 15;
@@ -237,11 +233,11 @@ __device__ __forceinline__ uint2 load_b_frag(const uint8_t *smem_base, int abs_r
 }
 
 // ============================================================================
-// __launch_bounds__(256, 2) pins the per-block register budget to
-// 65536/(2*256) = 128 regs/thread max. This prevents the compiler from
-// over-allocating and dropping to 1 block/SM (occupancy cliff) in the v1
-// experiment and forces the occupancy tier we designed the SMEM layout for.
-__global__ __launch_bounds__(256, 2) void gemm_int4_kernel(
+// __launch_bounds__(128, 6): 128 threads/block x 6 blocks/SM = 24 active
+// warps/SM. Budget is 65536/(6*128) = 85 regs/thread, which comfortably fits
+// a ~60-reg design but guards against the compiler silently allowing 100+ reg
+// usage (which would drop us to 4 blocks/SM and match the old 16-warp cliff).
+__global__ __launch_bounds__(NUM_THREADS, 6) void gemm_int4_kernel(
     const uint8_t *__restrict__ A,
     const uint8_t *__restrict__ B,
     const half    *__restrict__ scales_A,
@@ -262,7 +258,6 @@ __global__ __launch_bounds__(256, 2) void gemm_int4_kernel(
     const int warp_bm   = warp_m_id * WARP_M;
     const int warp_bn   = warp_n_id * WARP_N;
 
-    // ---- SMEM pointers (A, B, scales_A, scales_B for each stage) ----
     extern __shared__ uint8_t smem[];
     uint8_t *sA[NUM_STAGES];
     uint8_t *sB[NUM_STAGES];
@@ -277,7 +272,6 @@ __global__ __launch_bounds__(256, 2) void gemm_int4_kernel(
         sSb[i] = reinterpret_cast<half*>(base + TILE_A_BYTES + TILE_B_BYTES + TILE_SA_BYTES);
     }
 
-    // FP32 accumulators: one m16n8k64 MMA's 4-element output per (tm, tn).
     float acc[TILES_M][TILES_N][4];
     #pragma unroll
     for (int tm = 0; tm < TILES_M; tm++)
@@ -287,14 +281,13 @@ __global__ __launch_bounds__(256, 2) void gemm_int4_kernel(
             for (int i = 0; i < 4; i++)
                 acc[tm][tn][i] = 0.f;
 
-    // ---- Cooperative tile loader (weights + scales, one cp.async group) ----
-    //   - 256 threads x 16 B = 4096 B per weight tile -> each thread issues one
-    //     cp.async_16 for A and one for B.
-    //   - First 16 threads also issue 16 B of scales_A (16 * 8 halves = 128).
-    //   - Next 16 threads issue 16 B of scales_B the same way.
-    // The writes to the scales SMEM do not swizzle: the scales are read by
-    // index, not by ldmatrix.
-    const size_t tile_bytes = (size_t)(BLOCK_M * (BLOCK_K / 2));   // 4096
+    // ---- Cooperative tile loader ----
+    // A tile = 64 rows x 32 bytes = 2048 B -> 128 threads x 16 B each.
+    // B tile = same. Each of the 128 threads issues one cp.async for A and one
+    // for B (total 256 cp.async / block / K-iter for weights).
+    // Scales = 64 halves each = 128 B. 8 threads cover scales_A (16 B each),
+    // the next 8 cover scales_B.
+    const size_t tile_bytes = (size_t)(BLOCK_M * (BLOCK_K / 2));   // 2048
     const size_t a_block_base = (size_t)blockIdx.y * (size_t)num_k_tiles * tile_bytes;
     const size_t b_block_base = (size_t)blockIdx.x * (size_t)num_k_tiles * tile_bytes;
 
@@ -308,9 +301,7 @@ __global__ __launch_bounds__(256, 2) void gemm_int4_kernel(
         cp_async_16(sA[s] + smem_off, A + a_block_base + tile_off, true);
         cp_async_16(sB[s] + smem_off, B + b_block_base + tile_off, true);
 
-        // Scales live in the same cp.async group as the weights they pair
-        // with. Group index == kt (BLOCK_K == group_size).
-        if (tid < 16) {
+        if (tid < 8) {
             size_t sa_off = (size_t)blockIdx.y * num_groups * BLOCK_M
                           + (size_t)kt * BLOCK_M
                           + (size_t)tid * 8;
@@ -318,8 +309,8 @@ __global__ __launch_bounds__(256, 2) void gemm_int4_kernel(
                 reinterpret_cast<uint8_t*>(sSa[s]) + tid * 16,
                 scales_A + sa_off,
                 true);
-        } else if (tid < 32) {
-            int idx = tid - 16;
+        } else if (tid < 16) {
+            int idx = tid - 8;
             size_t sb_off = (size_t)blockIdx.x * num_groups * BLOCK_N
                           + (size_t)kt * BLOCK_N
                           + (size_t)idx * 8;
@@ -331,7 +322,6 @@ __global__ __launch_bounds__(256, 2) void gemm_int4_kernel(
         cp_commit();
     };
 
-    // Pipeline warm-up.
     #pragma unroll
     for (int i = 0; i < NUM_STAGES - 1; i++) {
         if (i < num_k_tiles) load_tile(i, i);
@@ -347,11 +337,9 @@ __global__ __launch_bounds__(256, 2) void gemm_int4_kernel(
         int max_pending = num_k_tiles - 1 - kt;
         if (max_pending > NUM_STAGES - 1) max_pending = NUM_STAGES - 1;
         cp_wait(max_pending);
-        __syncthreads();   // Single top-of-iter barrier -- weights + scales
-                           // all visible from this point.
+        __syncthreads();
 
-        // -------- Per-K-iter register-cached scales --------
-        // scales_A: quad-broadcast one fp16 per row into sa_lo/sa_hi.
+        // Per-K-iter register-cached scales_A (quad-broadcast from SMEM).
         float sa_lo[TILES_M], sa_hi[TILES_M];
         #pragma unroll
         for (int tm = 0; tm < TILES_M; tm++) {
@@ -366,18 +354,13 @@ __global__ __launch_bounds__(256, 2) void gemm_int4_kernel(
             sa_hi[tm] = __shfl_sync(0xffffffff, v_hi, laneId & ~3);
         }
 
-        // -------- Preload A-frags (reused across TILES_N B-frags) --------
         uint4 af[TILES_M];
         #pragma unroll
         for (int tm = 0; tm < TILES_M; tm++) {
             af[tm] = load_a_frag(sA[s], warp_bm + tm * 16);
         }
 
-        // -------- MMA mainloop (16 MMAs per warp, single ldmatrix.x2 B) --------
-        // scales_B values are shfl-broadcast per-tn from SMEM directly rather
-        // than hoisted into a register cache. The v1 pre-broadcast pattern
-        // (sb_pair[TILES_N][2]) added +16 fp32 regs/thread and dropped the
-        // kernel out of the 2-block/SM tier -- net -30% on the benchmark.
+        // 8 MMAs per warp per K-iter (2 TILES_M x 4 TILES_N).
         #pragma unroll
         for (int tn = 0; tn < TILES_N; tn++) {
             int frag_bn = warp_bn + tn * 8;
@@ -404,7 +387,7 @@ __global__ __launch_bounds__(256, 2) void gemm_int4_kernel(
                 acc[tm][tn][3] = __fmaf_rn((float)p[3], sa_hi_sb1, acc[tm][tn][3]);
             }
         }
-        __syncthreads();   // End-of-iter: guard against next prefetch race.
+        __syncthreads();
     }
 
     // ---- Epilogue: vectorized half2 stores ----
@@ -427,7 +410,6 @@ __global__ __launch_bounds__(256, 2) void gemm_int4_kernel(
     }
 }
 
-// ---- Host wrapper (drop-in replacement) ----
 torch::Tensor gemm_int4_custom(
     torch::Tensor A_packed, torch::Tensor B_packed,
     torch::Tensor scales_A, torch::Tensor scales_B, int group_size)
@@ -440,7 +422,7 @@ torch::Tensor gemm_int4_custom(
         torch::TensorOptions().dtype(torch::kHalf).device(A_packed.device()));
 
     dim3 grid((N + BLOCK_N - 1) / BLOCK_N, (M + BLOCK_M - 1) / BLOCK_M);
-    dim3 block(WARP_SZ * NUM_WARPS);
+    dim3 block(NUM_THREADS);
     int smem = NUM_STAGES * STAGE_BYTES;
 
     gemm_int4_kernel<<<grid, block, smem, at::cuda::getCurrentCUDAStream()>>>(

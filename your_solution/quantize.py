@@ -16,7 +16,7 @@ The packed format convention:
 import torch
 
 
-BLOCK_N = 128  # must match kernel.cu BLOCK_N
+BLOCK_N = 64  # must match kernel.cu BLOCK_N (v3: 64x64 tile)
 
 
 def quantize_weights(weight: torch.Tensor, group_size: int = 64) -> dict:
