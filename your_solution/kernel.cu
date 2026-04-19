@@ -109,22 +109,25 @@ std::vector<torch::Tensor> quantize_int4_custom(torch::Tensor input, int group_s
 }
 
 // ============================================================================
-// GEMM kernel -- COMET-style W4A4 pipeline (v1)
+// GEMM kernel -- COMET-style W4A4 pipeline (v2: live-state trimmed)
 //
-// The architecture attacks the two structural ceilings the old 200-TOPs kernel
-// hit: (1) three __syncthreads per K-iter for a 2-stage pipeline, and (2) the
-// scales_B staging fighting with the weights staging for SMEM bandwidth.
+// The architecture attacks the structural ceiling the old 200-TOPs kernel hit:
+// three __syncthreads per K-iter, driven by a smem_sb staging step that was
+// separate from the weights cp.async group.
 //
 // Key changes vs the old kernel:
-//   - scales_A and scales_B live in the SAME cp.async pipeline as the weight
-//     tiles. One committed group drains A + B + scales_A + scales_B together,
-//     so the extra "load scales_B to SMEM + sync" stage is gone.
-//   - Single __syncthreads per K-iter body (down from three). All scale-read
-//     traffic happens against SMEM that is already visible post cp.async.
-//   - scales_B values for all TILES_N are hoisted into a per-K-iter register
-//     cache, removing the shfl-broadcast from the inner tile loop.
-//   - Single ldmatrix.x2 B-frag load is kept (the paired x4 variant regressed
-//     on Ampere because of the extra register live range it introduced).
+//   - scales_A and scales_B live in the SAME cp.async group as the weight
+//     tiles. A single committed group drains A + B + scales_A + scales_B
+//     together, so the "gmem -> fp32 smem_sb + extra sync" stage is gone.
+//   - Down to 2 __syncthreads per K-iter (top-of-iter after cp_wait +
+//     end-of-iter to guard the prefetch stage-reuse race).
+//   - Single ldmatrix.x2 B-frag load. The paired x4 variant regressed on
+//     Ampere due to the extra register live range, and the v1 sb_pair
+//     register cache regressed 30% because it pushed the kernel out of the
+//     2-block/SM tier. v2 deliberately reads scales_B per-tn from SMEM and
+//     shfl-broadcasts inside the tile loop -- keeps the live-state flat.
+//   - __launch_bounds__(256, 2) pins the register budget to 128 regs/thread
+//     so the compiler can't silently drop occupancy.
 //
 // Fixed layout:
 //   BLOCK_M=BLOCK_N=128, BLOCK_K=group_size=64, 8 warps in a 4x2 grid.
@@ -234,7 +237,11 @@ __device__ __forceinline__ uint2 load_b_frag(const uint8_t *smem_base, int abs_r
 }
 
 // ============================================================================
-__global__ void gemm_int4_kernel(
+// __launch_bounds__(256, 2) pins the per-block register budget to
+// 65536/(2*256) = 128 regs/thread max. This prevents the compiler from
+// over-allocating and dropping to 1 block/SM (occupancy cliff) in the v1
+// experiment and forces the occupancy tier we designed the SMEM layout for.
+__global__ __launch_bounds__(256, 2) void gemm_int4_kernel(
     const uint8_t *__restrict__ A,
     const uint8_t *__restrict__ B,
     const half    *__restrict__ scales_A,
@@ -359,23 +366,6 @@ __global__ void gemm_int4_kernel(
             sa_hi[tm] = __shfl_sync(0xffffffff, v_hi, laneId & ~3);
         }
 
-        // scales_B: hoist all TILES_N shfl-broadcasts out of the tile loop.
-        // Each lane ends up with sb_pair[tn][0/1] = scale for the 2 adjacent
-        // N-columns this lane owns in tile tn.
-        float sb_pair[TILES_N][2];
-        #pragma unroll
-        for (int tn = 0; tn < TILES_N; tn++) {
-            int frag_bn = warp_bn + tn * 8;
-            float v0 = 0.f, v1 = 0.f;
-            if (laneId < 4) {
-                int bc0 = frag_bn + laneId * 2;
-                v0 = __half2float(sSb[s][bc0]);
-                v1 = __half2float(sSb[s][bc0 + 1]);
-            }
-            sb_pair[tn][0] = __shfl_sync(0xffffffff, v0, laneId & 3);
-            sb_pair[tn][1] = __shfl_sync(0xffffffff, v1, laneId & 3);
-        }
-
         // -------- Preload A-frags (reused across TILES_N B-frags) --------
         uint4 af[TILES_M];
         #pragma unroll
@@ -384,12 +374,22 @@ __global__ void gemm_int4_kernel(
         }
 
         // -------- MMA mainloop (16 MMAs per warp, single ldmatrix.x2 B) --------
+        // scales_B values are shfl-broadcast per-tn from SMEM directly rather
+        // than hoisted into a register cache. The v1 pre-broadcast pattern
+        // (sb_pair[TILES_N][2]) added +16 fp32 regs/thread and dropped the
+        // kernel out of the 2-block/SM tier -- net -30% on the benchmark.
         #pragma unroll
         for (int tn = 0; tn < TILES_N; tn++) {
             int frag_bn = warp_bn + tn * 8;
             uint2 bf = load_b_frag(sB[s], frag_bn);
-            float sb0 = sb_pair[tn][0];
-            float sb1 = sb_pair[tn][1];
+            float v_sb0 = 0.f, v_sb1 = 0.f;
+            if (laneId < 4) {
+                int bc0 = frag_bn + laneId * 2;
+                v_sb0 = __half2float(sSb[s][bc0]);
+                v_sb1 = __half2float(sSb[s][bc0 + 1]);
+            }
+            float sb0 = __shfl_sync(0xffffffff, v_sb0, laneId & 3);
+            float sb1 = __shfl_sync(0xffffffff, v_sb1, laneId & 3);
             #pragma unroll
             for (int tm = 0; tm < TILES_M; tm++) {
                 float sa_lo_sb0 = sa_lo[tm] * sb0;
