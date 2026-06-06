@@ -48,9 +48,11 @@ def quantize_weights(weight: torch.Tensor, group_size: int = 64) -> dict:
     q = (w * rscale).round().clamp(-8, 7).to(torch.int8)  # [N, num_groups, group_size]
     q = q.reshape(N, K)
 
-    # Pack two INT4 values per byte: low nibble = even, high nibble = odd
-    even = (q[:, 0::2] & 0xF).to(torch.uint8)
-    odd = ((q[:, 1::2] & 0xF) << 4).to(torch.uint8)
+    # Pack two INT4 values per byte: low nibble = even, high nibble = odd.
+    # Cast to uint8 *before* the shift so that high nibbles (e.g. 15 for -1)
+    # produce 240 (0xf0) without intermediate signed-int8 wrap.
+    even = (q[:, 0::2].to(torch.uint8) & 0x0F)
+    odd = ((q[:, 1::2].to(torch.uint8) & 0x0F) << 4)
     packed = odd | even  # [N, K//2]
 
     scales = scale.squeeze(-1).half()  # [N, num_groups]
