@@ -78,3 +78,7 @@ cuda-challenge/
   optimized/            # High-performance nunchaku-based baseline
   flux_dump/            # Generated data (run download_data.py)
 ```
+
+## License
+
+MIT. See [LICENSE](LICENSE).
